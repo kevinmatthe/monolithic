@@ -189,7 +189,7 @@ class OriginUpstreamTests(unittest.TestCase):
     def test_dns_tries_next_configured_resolver_after_failure(self):
         failure = subprocess.TimeoutExpired('dig', 5)
         answer = subprocess.CompletedProcess([], 0, '192.0.2.42\n', '')
-        with mock.patch.dict(origin.os.environ, {'UPSTREAM_DNS': '192.0.2.53 192.0.2.54'}), mock.patch.object(origin.subprocess, 'run', side_effect=[failure, answer]) as run:
+        with mock.patch.dict(origin.os.environ, {'UPSTREAM_DNS': '192.0.2.53 192.0.2.54'}), mock.patch.object(origin.subprocess, 'run', side_effect=[failure, failure, answer, subprocess.CompletedProcess([], 0, '', '')]) as run:
             self.assertEqual(origin.resolve_dns('cdn.example.net'), ['192.0.2.42'])
         self.assertIn('@192.0.2.54', run.call_args.args[0])
 
@@ -205,6 +205,123 @@ class OriginUpstreamTests(unittest.TestCase):
             resolver(f'edge-{i}.example.net')
         self.assertLessEqual(len(resolver.entries), origin.MAX_HOSTS * 2)
         self.assertNotIn('edge-0.example.net', resolver.entries)
+
+
+    def test_managed_pools_support_ipv6_and_persist_it_across_restart(self):
+        value = origin.render({'cdn.example.net': ['192.0.2.8', '2001:db8::8']})
+        self.assertIn('server [2001:db8::8]:80', value)
+        self.assertIn('server [2001:db8::8]:443', value)
+        self.assertEqual(set(origin.previous_records(value)['cdn.example.net']), {'192.0.2.8', '2001:db8::8'})
+
+    def test_managed_pool_rejects_local_ipv6_addresses(self):
+        for address in ['::', '::1', 'fc00::1', 'fe80::1', 'ff02::1', '::ffff:127.0.0.1']:
+            with self.subTest(address=address), self.assertRaises(ValueError):
+                origin.render({'cdn.example.net': [address]})
+
+    def test_managed_dns_collects_a_and_aaaa(self):
+        answers = [subprocess.CompletedProcess([], 0, '192.0.2.42\n', ''),
+                   subprocess.CompletedProcess([], 0, '2001:db8::42\n', '')]
+        with mock.patch.dict(origin.os.environ, {'UPSTREAM_DNS': '192.0.2.53', 'ORIGIN_KEEPALIVE_IPV6': 'on'}), mock.patch.object(origin.subprocess, 'run', side_effect=answers) as run:
+            self.assertEqual(origin.resolve_dns('cdn.example.net'), ['192.0.2.42', '2001:db8::42'])
+        self.assertEqual([call.args[0][-1] for call in run.call_args_list], ['A', 'AAAA'])
+
+    def test_ipv6_can_be_disabled_for_ipv4_only_networks(self):
+        answer = subprocess.CompletedProcess([], 0, '192.0.2.42\n', '')
+        with mock.patch.dict(origin.os.environ, {'UPSTREAM_DNS': '192.0.2.53', 'ORIGIN_KEEPALIVE_IPV6': 'off'}), mock.patch.object(origin.subprocess, 'run', return_value=answer) as run:
+            self.assertEqual(origin.resolve_dns('cdn.example.net'), ['192.0.2.42'])
+            self.assertIn('ipv6=off', origin.resolver_directive())
+        self.assertEqual(run.call_count, 1)
+
+    def test_native_pools_delegate_addresses_to_nginx(self):
+        with mock.patch.dict(origin.os.environ, {'UPSTREAM_DNS': '192.0.2.53 [2001:db8::53]:5353'}):
+            value = origin.render({'cdn.example.net': []}, native=True)
+        self.assertIn('server cdn.example.net:80 resolve', value)
+        self.assertIn('server cdn.example.net:443 resolve', value)
+        self.assertIn('zone ', value)
+        self.assertIn('resolver 192.0.2.53 [2001:db8::53]:5353', value)
+        self.assertIn('ipv6=on', value)
+        self.assertEqual(list(origin.previous_records(value)), ['cdn.example.net'])
+
+    def test_native_refresh_does_not_query_dns_or_reload_for_address_changes(self):
+        def forbidden_dns(_):
+            self.fail('Native mode must delegate DNS to nginx')
+        self.assertTrue(origin.refresh(self.path, forbidden_dns, self.nginx_run, bootstrap=True,
+                                       hosts=['cdn.example.net'], native=True))
+        self.assertFalse(origin.refresh(self.path, forbidden_dns, self.nginx_run,
+                                        hosts=['cdn.example.net'], native=True))
+        self.assertEqual(self.calls, [])
+        origin.refresh(self.path, forbidden_dns, self.nginx_run,
+                       hosts=['cdn.example.net', 'new.example.net'], native=True)
+        self.assertEqual(self.calls, [['nginx', '-t'], ['nginx', '-s', 'reload']])
+
+    def test_native_mode_is_selected_only_on_capable_nginx(self):
+        def version(value):
+            return lambda *args, **kwargs: subprocess.CompletedProcess([], 0, '', 'nginx version: nginx/' + value)
+        self.assertFalse(origin.select_native_dns('auto', version('1.24.0')))
+        self.assertTrue(origin.select_native_dns('auto', version('1.27.3')))
+        self.assertTrue(origin.select_native_dns('auto', version('1.30.6')))
+        self.assertFalse(origin.select_native_dns('managed', version('1.30.6')))
+        with self.assertRaises(ValueError):
+            origin.select_native_dns('native', version('1.24.0'))
+
+    def test_json_access_events_discover_hosts_without_parsing_main_log_format(self):
+        log = self.path.parent / 'origin-hosts.jsonl'
+        log.write_text('{"host":"NEW-EDGE.EXAMPLE.NET","redirect_host":""}\n'
+                       '{"host":"other.example.net","redirect_host":"target.example.net"}\n')
+        self.assertEqual(set(origin.discover_hosts(log)), {'new-edge.example.net', 'other.example.net'})
+        self.assertEqual(set(origin.discover_redirect_hosts(log)), {'new-edge.example.net', 'other.example.net', 'target.example.net'})
+        self.assertEqual(origin.discover_redirect_issuers(log), ['other.example.net'])
+
+    def test_json_discovery_ignores_malformed_nonstring_and_local_host_values(self):
+        log = self.path.parent / 'origin-hosts.jsonl'
+        log.write_text('{truncated\n["example.net"]\n'
+                       '{"host":null,"redirect_host":4}\n'
+                       '{"host":"lancache.steamcontent.com","redirect_host":"192.168.0.57"}\n'
+                       '{"host":"valid.example.net","redirect_host":""}\n')
+        self.assertEqual(origin.discover_hosts(log), ['valid.example.net'])
+
+    def test_owned_json_discovery_log_is_bounded(self):
+        log = self.path.parent / 'origin-hosts.jsonl'
+        log.write_text('{"host":"cdn.example.net","redirect_host":""}\n' * 30000)
+        self.assertIn('cdn.example.net', origin.discover_redirect_hosts(log))
+        self.assertLessEqual(log.stat().st_size, 1048576)
+
+
+    def test_native_bootstrap_reuses_hostnames_without_system_dns(self):
+        self.path.write_text(origin.render({'cdn.example.net': ['192.0.2.1']}))
+        def unavailable(_):
+            self.fail('Native bootstrap must not resolve origins in Python')
+        origin.bootstrap(self.path, unavailable, self.nginx_run, native=True)
+        self.assertIn('server cdn.example.net:80 resolve', self.path.read_text())
+        self.assertEqual(self.calls, [])
+
+    def test_offline_downgrade_does_not_leave_native_syntax_on_old_nginx(self):
+        self.path.write_text(origin.render({'cdn.example.net': []}, native=True))
+        def unavailable(_):
+            raise OSError('offline during rollback')
+        origin.bootstrap(self.path, unavailable, self.nginx_run, hosts=['cdn.example.net'], native=False)
+        self.assertNotIn(' resolve ', self.path.read_text())
+        self.assertIn('default $host;', self.path.read_text())
+
+
+    def test_ipv6_off_warm_boot_removes_disabled_family_from_saved_pools(self):
+        self.path.write_text(origin.render({'dual.example.net': ['192.0.2.1', '2001:db8::1'],
+                                           'v6.example.net': ['2001:db8::2']}))
+        def unavailable(_):
+            raise OSError('offline')
+        with mock.patch.dict(origin.os.environ, {'ORIGIN_KEEPALIVE_IPV6': 'off'}):
+            origin.bootstrap(self.path, unavailable, self.nginx_run)
+        self.assertNotIn('[2001:db8::', self.path.read_text())
+        self.assertIn('server 192.0.2.1:80', self.path.read_text())
+
+    def test_ipv6_off_offline_boot_clears_ipv6_only_saved_state(self):
+        self.path.write_text(origin.render({'v6.example.net': ['2001:db8::1']}))
+        def unavailable(_):
+            raise OSError('offline')
+        with mock.patch.dict(origin.os.environ, {'ORIGIN_KEEPALIVE_IPV6': 'off'}):
+            origin.bootstrap(self.path, unavailable, self.nginx_run, hosts=['v6.example.net'])
+        self.assertNotIn('[2001:db8::', self.path.read_text())
+        self.assertIn('default $host;', self.path.read_text())
 
 
 if __name__ == '__main__':
